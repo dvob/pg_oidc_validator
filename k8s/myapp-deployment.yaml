@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp
+  template:
+    metadata:
+      labels:
+        app: myapp
+    spec:
+      containers:
+      - name: myapp
+        image: dvob/postgres-oidc-client:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          while true; do
+            /usr/local/bin/test-client \
+              -conn 'host=postgres port=5432 dbname=myapp user=system:serviceaccount:default:myapp' \
+              -token-file /var/run/secrets/kubernetes.io/serviceaccount/token
+            sleep 10
+          done
+        volumeMounts:
+          - name: token-volume
+            mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            readOnly: true
+      serviceAccountName: myapp
+      volumes:
+        - name: token-volume
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600 
+                  audience: postgres
