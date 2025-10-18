@@ -5,16 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 ::pgrx::pg_module_magic!();
 
 // GUC variable for ISSUER_URL
 static ISSUER_URL: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
-// Cache for JWKS keys - initialized once in _PG_init()
-// OnceLock allows one-time initialization and lock-free concurrent reads
-static JWKS_CACHE: OnceLock<HashMap<String, DecodingKey>> = OnceLock::new();
+// Global token validator instance
+static TOKEN_VALIDATOR: OnceLock<Arc<OidcTokenValidator>> = OnceLock::new();
 
 pub const PG_OAUTH_VALIDATOR_MAGIC: u32 = 0x20250220;
 
@@ -82,64 +82,201 @@ struct Claims {
     extra: HashMap<String, serde_json::Value>,
 }
 
-fn load_jwks() -> Result<HashMap<String, DecodingKey>, Box<dyn std::error::Error>> {
-    // Get ISSUER_URL from GUC setting
+// ============================================================================
+// Token Validator Abstraction
+// ============================================================================
+
+/// Result of token validation
+#[derive(Debug)]
+pub struct ValidationResult {
+    pub authenticated_id: String,
+    pub authorized: bool,
+}
+
+/// Trait for token validators
+pub trait TokenValidator: Send + Sync {
+    /// Validate a token and return the authenticated identity
+    fn validate(
+        &self,
+        token: &str,
+        role: &str,
+    ) -> Result<ValidationResult, Box<dyn std::error::Error>>;
+}
+
+/// Provides the issuer URL from GUC configuration
+fn get_issuer_url() -> Result<String, Box<dyn std::error::Error>> {
     let issuer_cstring = ISSUER_URL
         .get()
         .ok_or("pg_oidc_validator.issuer_url is not configured")?;
 
-    let issuer_url = issuer_cstring.to_str()?;
+    Ok(issuer_cstring.to_str()?.to_string())
+}
 
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer_url.trim_end_matches('/')
-    );
+// ============================================================================
+// JWKS Cache with Rate-Limited Refresh
+// ============================================================================
 
-    log!("obtain public keys");
-    let discovery: OidcDiscovery = reqwest::blocking::get(&discovery_url)?.json()?;
+struct JwksCache {
+    keys: RwLock<HashMap<String, DecodingKey>>,
+    last_refresh: RwLock<Option<Instant>>,
+    refresh_cooldown: Duration,
+}
 
-    let jwks: Jwks = reqwest::blocking::get(&discovery.jwks_uri)?.json()?;
-
-    let mut keys = HashMap::new();
-    for key in jwks.keys {
-        if key.kty == "RSA" {
-            if let (Some(n), Some(e), Some(kid)) = (key.n, key.e, key.kid) {
-                if let Ok(decoding_key) = DecodingKey::from_rsa_components(&n, &e) {
-                    keys.insert(kid, decoding_key);
-                }
-            }
+impl JwksCache {
+    fn new(refresh_cooldown: Duration) -> Self {
+        Self {
+            keys: RwLock::new(HashMap::new()),
+            last_refresh: RwLock::new(None),
+            refresh_cooldown,
         }
     }
 
-    Ok(keys)
+    /// Initialize cache with JWKS keys from the issuer
+    fn initialize(&self, issuer_url: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        let keys = Self::fetch_jwks(issuer_url)?;
+        let count = keys.len();
+
+        *self.keys.write().unwrap() = keys;
+        *self.last_refresh.write().unwrap() = Some(Instant::now());
+
+        Ok(count)
+    }
+
+    /// Get a key by kid, potentially triggering a refresh if missing
+    fn get_key(
+        &self,
+        kid: &str,
+        issuer_url: &str,
+    ) -> Result<DecodingKey, Box<dyn std::error::Error>> {
+        // First, try to get the key from cache
+        {
+            let keys = self.keys.read().unwrap();
+            if let Some(key) = keys.get(kid) {
+                return Ok(key.clone());
+            }
+        }
+
+        // Key not found - check if we can refresh
+        let can_refresh = {
+            let last_refresh = self.last_refresh.read().unwrap();
+            match *last_refresh {
+                None => true, // Never refreshed
+                Some(last) => last.elapsed() >= self.refresh_cooldown,
+            }
+        };
+
+        if can_refresh {
+            // Refresh the cache
+            log!("Fetching JWKS keys for key ID '{}'", kid);
+            let new_keys = Self::fetch_jwks(issuer_url)?;
+            let key_count = new_keys.len();
+
+            let mut keys = self.keys.write().unwrap();
+            *keys = new_keys;
+            *self.last_refresh.write().unwrap() = Some(Instant::now());
+
+            log!(
+                "JWKS cache populated with {} keys (backend PID: {})",
+                key_count,
+                std::process::id()
+            );
+
+            // Try again
+            if let Some(key) = keys.get(kid) {
+                return Ok(key.clone());
+            }
+        } else {
+            return Err(format!("Unknown key ID '{}' (refresh on cooldown)", kid).into());
+        }
+        Err(format!("Unknown key ID '{}' after refresh", kid).into())
+    }
+
+    /// Fetch JWKS keys from the issuer
+    fn fetch_jwks(
+        issuer_url: &str,
+    ) -> Result<HashMap<String, DecodingKey>, Box<dyn std::error::Error>> {
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer_url.trim_end_matches('/')
+        );
+
+        log!("Fetching OIDC discovery from {}", discovery_url);
+        let discovery: OidcDiscovery = reqwest::blocking::get(&discovery_url)?.json()?;
+
+        log!("Fetching JWKS from {}", discovery.jwks_uri);
+        let jwks: Jwks = reqwest::blocking::get(&discovery.jwks_uri)?.json()?;
+
+        let mut keys = HashMap::new();
+        for key in jwks.keys {
+            if key.kty == "RSA" {
+                if let (Some(n), Some(e), Some(kid)) = (key.n, key.e, key.kid) {
+                    if let Ok(decoding_key) = DecodingKey::from_rsa_components(&n, &e) {
+                        keys.insert(kid, decoding_key);
+                    }
+                }
+            }
+        }
+
+        Ok(keys)
+    }
 }
 
-fn validate_token(token: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let header = decode_header(token)?;
-    let kid = header.kid.ok_or("Token missing 'kid' in header")?;
+// ============================================================================
+// OIDC Token Validator Implementation
+// ============================================================================
 
-    // Read from cache - lock-free after initialization
-    let cache = JWKS_CACHE.get().ok_or("JWKS cache not initialized")?;
-
-    let key = cache
-        .get(&kid)
-        .ok_or_else(|| format!("Unknown key ID: {}", kid))?;
-
-    // Set up validation
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.validate_aud = false;
-
-    let token_data = decode::<Claims>(token, key, &validation)?;
-
-    // let user = token_data
-    //     .claims
-    //     .preferred_username
-    //     .ok_or("Token missing 'preferred_username' claim")?;
-
-    Ok(token_data.claims.sub)
+pub struct OidcTokenValidator {
+    cache: JwksCache,
 }
 
-// Validator implementation
+impl OidcTokenValidator {
+    /// Create a new OIDC token validator
+    pub fn new(refresh_cooldown: Duration) -> Self {
+        Self {
+            cache: JwksCache::new(refresh_cooldown),
+        }
+    }
+
+    /// Initialize the validator by fetching JWKS keys
+    pub fn initialize(&self, issuer_url: &str) -> Result<usize, Box<dyn std::error::Error>> {
+        self.cache.initialize(issuer_url)
+    }
+}
+
+impl TokenValidator for OidcTokenValidator {
+    fn validate(
+        &self,
+        token: &str,
+        _role: &str,
+    ) -> Result<ValidationResult, Box<dyn std::error::Error>> {
+        let issuer_url = get_issuer_url()?;
+
+        // Decode header to get key ID
+        let header = decode_header(token)?;
+        let kid = header.kid.ok_or("Token missing 'kid' in header")?;
+
+        // Get the decoding key (may trigger cache refresh)
+        let key = self.cache.get_key(&kid, &issuer_url)?;
+
+        // Set up validation
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_aud = false;
+
+        // Decode and validate token
+        let token_data = decode::<Claims>(token, &key, &validation)?;
+
+        Ok(ValidationResult {
+            authenticated_id: token_data.claims.sub,
+            authorized: true,
+        })
+    }
+}
+
+// ============================================================================
+// PostgreSQL OAuth Validator Callbacks
+// ============================================================================
+
+/// Validator callback implementation
 unsafe extern "C" fn validate_cb(
     _state: *const ValidatorModuleState,
     token: *const c_char,
@@ -163,12 +300,26 @@ unsafe extern "C" fn validate_cb(
 
     info!("Validating JWT token for role '{}'", role_str);
 
-    // Validate the JWT token
-    match validate_token(token_str) {
-        Ok(username) => {
-            info!("Token validated successfully for user '{}'", username);
+    // Get the global validator instance
+    let validator = match TOKEN_VALIDATOR.get() {
+        Some(v) => v,
+        None => {
+            warning!("Token validator not initialized");
+            (*result).authorized = false;
+            (*result).authn_id = std::ptr::null_mut();
+            return false;
+        }
+    };
 
-            let username_cstr = match CString::new(username) {
+    // Validate the JWT token
+    match validator.validate(token_str, role_str) {
+        Ok(validation_result) => {
+            info!(
+                "Token validated successfully for user '{}'",
+                validation_result.authenticated_id
+            );
+
+            let username_cstr = match CString::new(validation_result.authenticated_id) {
                 Ok(s) => s,
                 Err(e) => {
                     log!("Failed to create CString: {}", e);
@@ -182,7 +333,7 @@ unsafe extern "C" fn validate_cb(
 
             // Set the result
             (*result).authn_id = authn_id;
-            (*result).authorized = true;
+            (*result).authorized = validation_result.authorized;
         }
         Err(e) => {
             warning!("Token validation failed: {}", e);
@@ -220,40 +371,28 @@ pub extern "C" fn _PG_init() {
         c"OIDC issuer URL for JWT token validation",
         c"The base URL of the OIDC provider (e.g., https://accounts.google.com)",
         &ISSUER_URL,
-        GucContext::Sighup,
+        GucContext::Postmaster, // Requires restart to change
         GucFlags::default(),
     );
 
-    // Try to load JWKS keys if issuer_url is configured
-    if let Some(issuer_cstring) = ISSUER_URL.get() {
-        let issuer = issuer_cstring.to_str().unwrap_or("invalid_utf8");
-        match load_jwks() {
-            Ok(keys) => {
-                let cache_size = keys.len();
-                // Initialize the cache - this can only be done once
-                if JWKS_CACHE.set(keys).is_ok() {
-                    log!(
-                        "pg_oidc_validator loaded successfully: cached {} JWKS key(s) from {}",
-                        cache_size,
-                        issuer
-                    );
-                } else {
-                    warning!("Failed to initialize JWKS cache (already initialized?)");
-                }
+    // Create the token validator with 60-second refresh cooldown
+    // Cache starts empty - will be populated on first validation attempt
+    let validator = Arc::new(OidcTokenValidator::new(Duration::from_secs(60)));
+    match get_issuer_url() {
+        Ok(url) => match validator.initialize(&url) {
+            Ok(count) => log!("successfully initialized JWKS cache with {} keys", count),
+            Err(err) => {
+                warning!("failed to initialize jwks cache: {}", err);
             }
-            Err(e) => {
-                warning!(
-                    "pg_oidc_validator loaded but failed to fetch JWKS keys: {}. \
-                     Check that pg_oidc_validator.issuer_url is configured correctly.",
-                    e
-                );
-            }
-        }
+        },
+        Err(err) => warning!("failed to obtain url {}", err),
+    };
+
+    // Store the validator globally
+    if TOKEN_VALIDATOR.set(validator).is_err() {
+        warning!("Failed to set global token validator (already initialized?)");
     } else {
-        warning!(
-            "pg_oidc_validator loaded but pg_oidc_validator.issuer_url is not configured. \
-             Set it in postgresql.conf and reload configuration."
-        );
+        log!("pg_oidc_validator loaded successfully (JWKS will be fetched on first use)");
     }
 }
 
