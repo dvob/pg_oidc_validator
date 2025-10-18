@@ -1,12 +1,20 @@
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use once_cell::sync::Lazy;
+use pgrx::guc::*;
 use pgrx::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::sync::OnceLock;
 
 ::pgrx::pg_module_magic!();
+
+// GUC variable for ISSUER_URL
+static ISSUER_URL: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
+// Cache for JWKS keys - initialized once in _PG_init()
+// OnceLock allows one-time initialization and lock-free concurrent reads
+static JWKS_CACHE: OnceLock<HashMap<String, DecodingKey>> = OnceLock::new();
 
 pub const PG_OAUTH_VALIDATOR_MAGIC: u32 = 0x20250220;
 
@@ -74,17 +82,13 @@ struct Claims {
     extra: HashMap<String, serde_json::Value>,
 }
 
-// Cache for JWKS keys
-static JWKS_CACHE: Lazy<HashMap<String, DecodingKey>> = Lazy::new(|| match load_jwks() {
-    Ok(keys) => keys,
-    Err(e) => {
-        log!("Failed to load JWKS: {}", e);
-        HashMap::new()
-    }
-});
-
 fn load_jwks() -> Result<HashMap<String, DecodingKey>, Box<dyn std::error::Error>> {
-    let issuer_url = std::env::var("ISSUER_URL")?;
+    // Get ISSUER_URL from GUC setting
+    let issuer_cstring = ISSUER_URL
+        .get()
+        .ok_or("pg_oidc_validator.issuer_url is not configured")?;
+
+    let issuer_url = issuer_cstring.to_str()?;
 
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
@@ -114,7 +118,10 @@ fn validate_token(token: &str) -> Result<String, Box<dyn std::error::Error>> {
     let header = decode_header(token)?;
     let kid = header.kid.ok_or("Token missing 'kid' in header")?;
 
-    let key = JWKS_CACHE
+    // Read from cache - lock-free after initialization
+    let cache = JWKS_CACHE.get().ok_or("JWKS cache not initialized")?;
+
+    let key = cache
         .get(&kid)
         .ok_or_else(|| format!("Unknown key ID: {}", kid))?;
 
@@ -197,7 +204,7 @@ static CALLBACKS: OAuthValidatorCallbacks = OAuthValidatorCallbacks {
 #[no_mangle]
 pub extern "C" fn _PG_init() {
     unsafe {
-        // we can verify if we are loaded via shared_preload_libraries
+        // Check if we're being loaded via shared_preload_libraries
         if !pg_sys::process_shared_preload_libraries_in_progress {
             log!(
                 "pg_oidc_validator is not loaded via shared_preload_libraries. \
@@ -205,20 +212,48 @@ pub extern "C" fn _PG_init() {
             );
             return;
         }
+    }
 
-        let cache_size = JWKS_CACHE.len();
+    // Define GUC for issuer URL
+    GucRegistry::define_string_guc(
+        c"pg_oidc_validator.issuer_url",
+        c"OIDC issuer URL for JWT token validation",
+        c"The base URL of the OIDC provider (e.g., https://accounts.google.com)",
+        &ISSUER_URL,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 
-        if cache_size > 0 {
-            log!(
-                "pg_oidc_validator loaded successfully: cached {} JWKS key(s) from ISSUER_URL",
-                cache_size
-            );
-        } else {
-            log!(
-                "pg_oidc_validator loaded but no JWKS keys were cached. \
-                 Check that ISSUER_URL environment variable is set correctly."
-            );
+    // Try to load JWKS keys if issuer_url is configured
+    if let Some(issuer_cstring) = ISSUER_URL.get() {
+        let issuer = issuer_cstring.to_str().unwrap_or("invalid_utf8");
+        match load_jwks() {
+            Ok(keys) => {
+                let cache_size = keys.len();
+                // Initialize the cache - this can only be done once
+                if JWKS_CACHE.set(keys).is_ok() {
+                    log!(
+                        "pg_oidc_validator loaded successfully: cached {} JWKS key(s) from {}",
+                        cache_size,
+                        issuer
+                    );
+                } else {
+                    warning!("Failed to initialize JWKS cache (already initialized?)");
+                }
+            }
+            Err(e) => {
+                warning!(
+                    "pg_oidc_validator loaded but failed to fetch JWKS keys: {}. \
+                     Check that pg_oidc_validator.issuer_url is configured correctly.",
+                    e
+                );
+            }
         }
+    } else {
+        warning!(
+            "pg_oidc_validator loaded but pg_oidc_validator.issuer_url is not configured. \
+             Set it in postgresql.conf and reload configuration."
+        );
     }
 }
 
