@@ -34,6 +34,8 @@ spec:
         - "-c"
         - "oauth_validator_libraries=oidc_validator"
         - "-c"
+        - "shared_preload_libraries=oidc_validator"
+        - "-c"
         - "log_connections=all"
         volumeMounts:
         - name: ca-certificates

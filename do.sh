@@ -24,6 +24,7 @@ do_docker-run() {
 	  -e "POSTGRES_HOST_AUTH_METHOD=oauth validator=oidc_validator issuer=$ISSUER_URL scope=" \
 	  -e ISSUER_URL \
 	  dvob/postgres-oidc \
+          -c shared_preload_libraries='oidc_validator' \
 	  -c oauth_validator_libraries='oidc_validator'
 }
 

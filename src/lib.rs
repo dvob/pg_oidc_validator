@@ -195,7 +195,35 @@ static CALLBACKS: OAuthValidatorCallbacks = OAuthValidatorCallbacks {
 };
 
 #[no_mangle]
+pub extern "C" fn _PG_init() {
+    unsafe {
+        // we can verify if we are loaded via shared_preload_libraries
+        if !pg_sys::process_shared_preload_libraries_in_progress {
+            log!(
+                "pg_oidc_validator is not loaded via shared_preload_libraries. \
+                 JWKS keys will be fetched for each connection, which may cause performance issues."
+            );
+            return;
+        }
+
+        let cache_size = JWKS_CACHE.len();
+
+        if cache_size > 0 {
+            log!(
+                "pg_oidc_validator loaded successfully: cached {} JWKS key(s) from ISSUER_URL",
+                cache_size
+            );
+        } else {
+            log!(
+                "pg_oidc_validator loaded but no JWKS keys were cached. \
+                 Check that ISSUER_URL environment variable is set correctly."
+            );
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn _PG_oauth_validator_module_init() -> *const OAuthValidatorCallbacks {
-    log!("load validator");
+    log!("OAuth validator module init called for new connection");
     &CALLBACKS
 }
