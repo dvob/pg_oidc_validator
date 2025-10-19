@@ -27,8 +27,9 @@ static TOKEN_VALIDATOR: OnceLock<Arc<OidcTokenValidator>> = OnceLock::new();
 // Shared memory state pointer (initialized at startup)
 static mut SHARED_STATE: *mut SharedValidatorState = std::ptr::null_mut();
 
-// Previous shmem_startup_hook
+// Previous hooks
 static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
+static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
 pub const PG_OAUTH_VALIDATOR_MAGIC: u32 = 0x20250220;
 
@@ -81,6 +82,9 @@ struct ValidationSlot {
     backend_pid: i32,
     request_time: i64,      // Timestamp when request was made
 
+    /// Backend's latch to wake up when response is ready
+    backend_latch: *mut pg_sys::Latch,
+
     /// Request data
     token: [u8; MAX_TOKEN_SIZE],
     token_len: usize,
@@ -106,6 +110,16 @@ struct SharedValidatorState {
     /// Array of validation slots
     slots: [ValidationSlot; MAX_VALIDATION_SLOTS],
 
+    /// Work queue: indices of slots with pending requests
+    /// Protected by queue_lock
+    queue_lock: pg_sys::slock_t,
+    pending_queue: [usize; MAX_VALIDATION_SLOTS],
+    queue_head: usize,
+    queue_tail: usize,
+
+    /// Worker latch: signaled when new work is enqueued
+    worker_latch: pg_sys::Latch,
+
     /// Statistics
     total_validations: pg_sys::pg_atomic_uint64,
     successful_validations: pg_sys::pg_atomic_uint64,
@@ -118,6 +132,7 @@ impl ValidationSlot {
         self.in_use = false;
         self.backend_pid = 0;
         self.request_time = 0;
+        self.backend_latch = std::ptr::null_mut();
         self.token_len = 0;
         self.role_len = 0;
         self.response_ready = false;
@@ -250,6 +265,44 @@ fn current_timestamp_ms() -> i64 {
 }
 
 // ============================================================================
+// Work Queue Management
+// ============================================================================
+
+/// Enqueue a slot index for the worker to process
+unsafe fn enqueue_work(state: *mut SharedValidatorState, slot_idx: usize) {
+    pg_sys::SpinLockAcquire(&mut (*state).queue_lock as *mut _);
+
+    // Check if queue is full (should never happen with same number of slots and queue entries)
+    let next_tail = ((*state).queue_tail + 1) % MAX_VALIDATION_SLOTS;
+    if next_tail != (*state).queue_head {
+        (*state).pending_queue[(*state).queue_tail] = slot_idx;
+        (*state).queue_tail = next_tail;
+    }
+
+    pg_sys::SpinLockRelease(&mut (*state).queue_lock as *mut _);
+
+    // Wake up the worker
+    pg_sys::SetLatch(&mut (*state).worker_latch as *mut _);
+}
+
+/// Dequeue a slot index for processing (returns None if queue is empty)
+unsafe fn dequeue_work(state: *mut SharedValidatorState) -> Option<usize> {
+    pg_sys::SpinLockAcquire(&mut (*state).queue_lock as *mut _);
+
+    let result = if (*state).queue_head == (*state).queue_tail {
+        // Queue is empty
+        None
+    } else {
+        let slot_idx = (*state).pending_queue[(*state).queue_head];
+        (*state).queue_head = ((*state).queue_head + 1) % MAX_VALIDATION_SLOTS;
+        Some(slot_idx)
+    };
+
+    pg_sys::SpinLockRelease(&mut (*state).queue_lock as *mut _);
+    result
+}
+
+// ============================================================================
 // Shared Memory Management
 // ============================================================================
 
@@ -275,6 +328,14 @@ unsafe fn init_shared_state() {
     for i in 0..MAX_VALIDATION_SLOTS {
         (*state).slots[i].init();
     }
+
+    // Initialize work queue
+    pg_sys::SpinLockInit(&mut (*state).queue_lock as *mut _);
+    (*state).queue_head = 0;
+    (*state).queue_tail = 0;
+
+    // Initialize worker latch (just zero it out, worker will take ownership)
+    std::ptr::write_bytes(&mut (*state).worker_latch as *mut _, 0, 1);
 
     // Initialize statistics
     pg_sys::pg_atomic_init_u64(&mut (*state).total_validations as *mut _, 0);
@@ -323,50 +384,62 @@ unsafe fn allocate_slot() -> Result<*mut ValidationSlot, String> {
     }
 }
 
-/// Submit a validation request and wait for response
+/// Submit a validation request and wait for response (using latches - efficient!)
 unsafe fn validate_via_worker(token: &str, role: &str) -> Result<ValidationResult, String> {
+    let state = get_shared_state();
+
     // Allocate a slot
     let slot = allocate_slot()?;
+    let slot_idx = ((slot as usize) - ((*state).slots.as_ptr() as usize)) / std::mem::size_of::<ValidationSlot>();
+
+    // Store our latch so worker can wake us up
+    (*slot).backend_latch = &mut (*pg_sys::MyProc).procLatch as *mut _;
 
     // Set the request data
     (*slot).set_request(token, role)?;
 
-    // Wait for response with timeout
-    let start_time = current_timestamp_ms();
+    // Enqueue work for the worker and wake it up
+    enqueue_work(state, slot_idx);
+
+    // Wait efficiently using latch - uses ZERO CPU while waiting!
     let timeout_ms = VALIDATION_TIMEOUT_MS;
+    // Use WAIT_EVENT_EXTENSION for custom wait events
+    let wait_event = 0x0D000000u32; // PG_WAIT_EXTENSION base
 
-    loop {
-        // Check if response is ready
-        if (*slot).is_response_ready() {
-            let (success, authorized, authn_id, error_msg) = (*slot).get_response();
+    let rc = pg_sys::WaitLatch(
+        &mut (*pg_sys::MyProc).procLatch as *mut _,
+        (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_EXIT_ON_PM_DEATH) as i32,
+        timeout_ms,
+        wait_event,
+    );
 
-            // Release the slot
-            (*slot).release();
+    // Reset the latch for future use
+    pg_sys::ResetLatch(&mut (*pg_sys::MyProc).procLatch as *mut _);
 
-            if success {
-                return Ok(ValidationResult {
-                    authenticated_id: authn_id,
-                    authorized,
-                });
-            } else {
-                return Err(error_msg);
-            }
+    // Check if we have a response
+    if (*slot).is_response_ready() {
+        let (success, authorized, authn_id, error_msg) = (*slot).get_response();
+
+        // Release the slot
+        (*slot).release();
+
+        if success {
+            return Ok(ValidationResult {
+                authenticated_id: authn_id,
+                authorized,
+            });
+        } else {
+            return Err(error_msg);
         }
+    } else {
+        // Timeout or postmaster death
+        (*slot).release();
 
-        // Check timeout
-        let elapsed = current_timestamp_ms() - start_time;
-        if elapsed > timeout_ms {
-            (*slot).release();
-            return Err(format!("Validation timeout after {} ms", elapsed));
+        if rc & pg_sys::WL_TIMEOUT as i32 != 0 {
+            return Err(format!("Validation timeout after {} ms", timeout_ms));
+        } else {
+            return Err("Validation interrupted (postmaster died?)".to_string());
         }
-
-        // Sleep briefly to avoid busy-waiting
-        // In production, we'd use a latch here for efficiency
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Check for interrupts (ProcessInterrupts is available in pg_sys)
-        // Note: We can't directly call CHECK_FOR_INTERRUPTS macro from Rust
-        // but the sleep and loop should be safe for backend processes
     }
 }
 
@@ -598,18 +671,12 @@ impl TokenValidator for OidcTokenValidator {
 // ============================================================================
 
 /// Background worker main function
+#[no_mangle]
 #[pg_guard]
 pub extern "C-unwind" fn jwks_validator_worker_main(_arg: pg_sys::Datum) {
     unsafe {
         // Unblock signals (allows shutdown via SIGTERM)
         pg_sys::BackgroundWorkerUnblockSignals();
-
-        // Connect to the database (required for shared memory access)
-        pg_sys::BackgroundWorkerInitializeConnection(
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-        );
 
         log!("JWKS validator background worker started");
 
@@ -622,64 +689,87 @@ pub extern "C-unwind" fn jwks_validator_worker_main(_arg: pg_sys::Datum) {
             }
         };
 
-        // Main processing loop
-        // Note: pgrx handles signal processing, we just loop until interrupted
+        let state = get_shared_state();
+
+        // Initialize the worker latch (this also claims ownership for this process)
+        pg_sys::InitLatch(&mut (*state).worker_latch as *mut _);
+
+        // Main processing loop - efficient, event-driven!
+        // This loop uses ZERO CPU when idle
         loop {
-            // Process all pending validation requests
-            process_validation_requests(validator);
+            // Process all pending work from the queue
+            while let Some(slot_idx) = dequeue_work(state) {
+                process_slot(validator, state, slot_idx);
+            }
 
-            // Sleep briefly before next iteration
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // No more work - sleep until a backend wakes us up
+            // This uses ZERO CPU while waiting!
+            let wait_event = 0x0D000000u32; // PG_WAIT_EXTENSION base
+            let rc = pg_sys::WaitLatch(
+                &mut (*state).worker_latch as *mut _,
+                (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_EXIT_ON_PM_DEATH) as i32,
+                1000, // Wake up every second to check for shutdown
+                wait_event,
+            );
 
-            // The background worker framework will terminate us on SIGTERM
+            // Reset latch for next iteration
+            pg_sys::ResetLatch(&mut (*state).worker_latch as *mut _);
+
+            // Check if we should exit (postmaster died)
+            if rc & pg_sys::WL_EXIT_ON_PM_DEATH as i32 != 0 {
+                log!("JWKS validator background worker shutting down (postmaster died)");
+                break;
+            }
         }
+
+        log!("JWKS validator background worker exiting");
     }
 }
 
-/// Process all pending validation requests
-unsafe fn process_validation_requests(validator: &Arc<OidcTokenValidator>) {
-    let state = get_shared_state();
+/// Process a single validation request from a slot
+unsafe fn process_slot(validator: &Arc<OidcTokenValidator>, state: *mut SharedValidatorState, slot_idx: usize) {
+    let slot = &mut (*state).slots[slot_idx];
 
-    // Scan all slots for pending requests
-    for i in 0..MAX_VALIDATION_SLOTS {
-        let slot = &mut (*state).slots[i];
+    // Get the request data
+    if let Some((token, role)) = slot.get_request() {
+        // Increment total validations
+        pg_sys::pg_atomic_fetch_add_u64(&mut (*state).total_validations as *mut _, 1);
 
-        // Check if this slot has a pending request
-        if let Some((token, role)) = slot.get_request() {
-            // Increment total validations
-            pg_sys::pg_atomic_fetch_add_u64(&mut (*state).total_validations as *mut _, 1);
-
-            // Perform the validation
-            match validator.validate(&token, &role) {
-                Ok(validation_result) => {
-                    // Success - write response
-                    if let Err(e) = slot.set_response(
-                        true,
-                        validation_result.authorized,
-                        &validation_result.authenticated_id,
-                        "",
-                    ) {
-                        log!("Failed to set response: {}", e);
-                    } else {
-                        pg_sys::pg_atomic_fetch_add_u64(
-                            &mut (*state).successful_validations as *mut _,
-                            1,
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Failure - write error response
-                    let error_msg = e.to_string();
-                    if let Err(e) = slot.set_response(false, false, "", &error_msg) {
-                        log!("Failed to set error response: {}", e);
-                    } else {
-                        pg_sys::pg_atomic_fetch_add_u64(
-                            &mut (*state).failed_validations as *mut _,
-                            1,
-                        );
-                    }
+        // Perform the validation
+        match validator.validate(&token, &role) {
+            Ok(validation_result) => {
+                // Success - write response
+                if let Err(e) = slot.set_response(
+                    true,
+                    validation_result.authorized,
+                    &validation_result.authenticated_id,
+                    "",
+                ) {
+                    log!("Failed to set response: {}", e);
+                } else {
+                    pg_sys::pg_atomic_fetch_add_u64(
+                        &mut (*state).successful_validations as *mut _,
+                        1,
+                    );
                 }
             }
+            Err(e) => {
+                // Failure - write error response
+                let error_msg = e.to_string();
+                if let Err(e) = slot.set_response(false, false, "", &error_msg) {
+                    log!("Failed to set error response: {}", e);
+                } else {
+                    pg_sys::pg_atomic_fetch_add_u64(
+                        &mut (*state).failed_validations as *mut _,
+                        1,
+                    );
+                }
+            }
+        }
+
+        // Wake up the waiting backend
+        if !slot.backend_latch.is_null() {
+            pg_sys::SetLatch(slot.backend_latch);
         }
     }
 }
@@ -757,6 +847,20 @@ static CALLBACKS: OAuthValidatorCallbacks = OAuthValidatorCallbacks {
 // Module Initialization
 // ============================================================================
 
+/// Shared memory request hook - called early to request shared memory
+#[pg_guard]
+unsafe extern "C-unwind" fn oidc_validator_shmem_request() {
+    // Call previous hook if it exists
+    if let Some(prev_hook) = PREV_SHMEM_REQUEST_HOOK {
+        prev_hook();
+    }
+
+    // Request shared memory
+    let shmem_size = std::mem::size_of::<SharedValidatorState>();
+    pg_sys::RequestAddinShmemSpace(shmem_size);
+    pg_sys::RequestNamedLWLockTranche(c"pg_oidc_validator_locks".as_ptr() as *const i8, 1);
+}
+
 /// Shared memory startup hook
 #[pg_guard]
 unsafe extern "C-unwind" fn oidc_validator_shmem_startup() {
@@ -792,13 +896,13 @@ pub extern "C" fn _PG_init() {
         GucFlags::default(),
     );
 
-    // Request shared memory
+    // Install hooks for shared memory
     unsafe {
-        let shmem_size = std::mem::size_of::<SharedValidatorState>();
-        pg_sys::RequestAddinShmemSpace(shmem_size);
-        pg_sys::RequestNamedLWLockTranche(c"pg_oidc_validator_locks".as_ptr() as *const i8, 1);
+        // Install shmem_request_hook (for requesting shared memory)
+        PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
+        pg_sys::shmem_request_hook = Some(oidc_validator_shmem_request);
 
-        // Install shmem_startup_hook
+        // Install shmem_startup_hook (for initializing shared memory)
         PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
         pg_sys::shmem_startup_hook = Some(oidc_validator_shmem_startup);
     }
@@ -839,13 +943,13 @@ pub extern "C" fn _PG_init() {
             std::slice::from_raw_parts(type_bytes.as_ptr() as *const i8, type_bytes.len())
         );
 
-        // Worker flags
-        worker.bgw_flags = (pg_sys::BGWORKER_SHMEM_ACCESS | pg_sys::BGWORKER_BACKEND_DATABASE_CONNECTION) as i32;
+        // Worker flags (only need shared memory access, no database connection)
+        worker.bgw_flags = pg_sys::BGWORKER_SHMEM_ACCESS as i32;
         worker.bgw_start_time = pg_sys::BgWorkerStartTime::BgWorkerStart_PostmasterStart;
         worker.bgw_restart_time = 10; // Restart after 10 seconds if crashed
 
-        // Set main function name
-        let lib_name = c"pg_oidc_validator";
+        // Set library name (must match the actual .so file name)
+        let lib_name = c"oidc_validator";
         let lib_bytes = lib_name.to_bytes_with_nul();
         worker.bgw_library_name[..lib_bytes.len()].copy_from_slice(
             std::slice::from_raw_parts(lib_bytes.as_ptr() as *const i8, lib_bytes.len())
